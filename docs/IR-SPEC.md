@@ -43,7 +43,7 @@ interface ContextRequirements {
 interface Node {
   // Identity
   id: string
-  type: 'transform'  // Always 'transform'
+  type: 'transform'  // Always 'transform' for now
 
   // Data flow
   inputs: PortSchema[]

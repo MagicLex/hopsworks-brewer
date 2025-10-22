@@ -20,7 +20,7 @@ Everything is a transformation node. No special types, just capabilities.
 ```typescript
 type Node = {
   id: string
-  type: 'transform'  // Only one type
+  type: 'transform'  // Only one type for now
 
   // Data flow
   inputs: PortSchema[]
@@ -42,6 +42,24 @@ type Node = {
 ```
 
 **Key Insight**: Any node can be augmented with an LLM prompt layer. This isn't a separate node type - it's a capability that can be added to any transformation.
+
+**Conditional Logic**: If/then branching is handled through edge conditions, not special nodes:
+```typescript
+edge: {
+  from: "risk_scorer.score",
+  to: "high_risk_handler",
+  condition: "score > 0.7"  // Only routes if condition is true
+}
+```
+This keeps nodes focused on transformation, while edges handle routing logic.
+
+**Future Node Types**: While everything is currently a `transform`, the type field exists for potential future extensions:
+- `boundary` - Explicit entry/exit points for sub-flows
+- `subflow` - Reference to another complete flow (composition)
+- `stream` - Different execution semantics for streaming data
+- `batch` - Batch processing with different parallelization
+
+These would only be added if transform nodes with different edge conditions prove insufficient.
 
 ### 2. Context Propagation
 
