@@ -1,0 +1,448 @@
+version: "1.0"
+
+metadata:
+  name: customer-service-agent
+  description: AI-powered customer support agent with Hopsworks feature integration
+  author: agent-builder
+  tags: [production, customer-facing, llm]
+
+context:
+  requires: [user_id, session_id, query]
+  optional: [auth_token, language]
+
+nodes:
+  # Fetch customer data from Hopsworks
+  fetch_customer:
+    type: transform
+    inputs:
+      - name: user_id
+        type: string
+        description: Customer identifier
+    outputs:
+      - name: customer_data
+        type: object
+        schema:
+          type: object
+          properties:
+            customer_id: {type: string}
+            tenure_months: {type: number}
+            support_tier: {type: string}
+            churn_risk: {type: number}
+            recent_tickets: {type: array}
+          required: [customer_id, support_tier]
+    transform:
+      mode: declarative
+      spec:
+        op: hopsworks.read_features
+        args:
+          feature_group: customers_360_v3
+          key: "${user_id}"
+          as_of: "${context.event_time}"
+          features:
+            - customer_id
+            - tenure_months
+            - support_tier
+            - churn_risk
+            - recent_tickets
+    runtime:
+      timeout_ms: 2000
+      retries: 2
+      requires_context: [event_time]
+    position: {x: 100, y: 200}
+
+  # Get conversation history from session
+  get_conversation:
+    type: transform
+    inputs:
+      - name: session_id
+        type: string
+    outputs:
+      - name: history
+        type: array
+        description: Recent conversation messages
+    state:
+      scope: session
+      key: "conversation_{session_id}"
+      ttl_seconds: 3600
+      backend: memory
+    transform:
+      mode: code
+      spec: |
+        def transform(inputs, context, state):
+            # Get conversation history
+            history = await state.get('history', [])
+
+            # Return last 5 exchanges
+            return {
+                'history': history[-10:] if len(history) > 10 else history
+            }
+    runtime:
+      timeout_ms: 500
+    position: {x: 100, y: 350}
+
+  # Check knowledge base for relevant articles
+  search_knowledge:
+    type: transform
+    inputs:
+      - name: query
+        type: string
+      - name: customer_data
+        type: object
+    outputs:
+      - name: articles
+        type: array
+        description: Relevant help articles
+    prompt:
+      system: "Extract key search terms from the user query for knowledge base search"
+      template: |
+        Query: {{ query }}
+        Customer Tier: {{ customer_data.support_tier }}
+
+        Extract 3-5 search keywords as JSON array.
+      model:
+        provider: openai
+        name: gpt-4o-mini
+      temperature: 0.1
+      output_schema:
+        type: array
+        items: {type: string}
+    transform:
+      mode: declarative
+      spec:
+        op: hopsworks.vector_search
+        args:
+          index: support_knowledge_v2
+          query: "${prompt_output}"
+          limit: 5
+          filters:
+            tier: "${customer_data.support_tier}"
+    runtime:
+      timeout_ms: 3000
+    position: {x: 300, y: 100}
+
+  # Generate response using LLM
+  generate_response:
+    type: transform
+    inputs:
+      - name: query
+        type: string
+      - name: customer_data
+        type: object
+      - name: history
+        type: array
+      - name: articles
+        type: array
+    outputs:
+      - name: response
+        type: object
+        schema:
+          type: object
+          properties:
+            answer: {type: string}
+            confidence: {type: number}
+            sources: {type: array, items: {type: string}}
+            escalate: {type: boolean}
+          required: [answer, confidence, escalate]
+    error:
+      name: generation_error
+      schema:
+        type: object
+        properties:
+          reason: {type: string}
+          retry_available: {type: boolean}
+    prompt:
+      system: |
+        You are a knowledgeable customer support agent.
+
+        Guidelines:
+        - Be helpful, professional, and empathetic
+        - Use the provided knowledge articles to answer questions
+        - Consider the customer's support tier and history
+        - If the issue is complex or involves billing/security, set escalate=true
+        - Always cite your sources from the knowledge base
+      template: |
+        Customer Information:
+        - ID: {{ customer_data.customer_id }}
+        - Support Tier: {{ customer_data.support_tier }}
+        - Tenure: {{ customer_data.tenure_months }} months
+        - Churn Risk: {{ customer_data.churn_risk }}
+        - Recent Tickets: {{ customer_data.recent_tickets | length }}
+
+        Conversation History:
+        {% for msg in history[-5:] %}
+        {{ msg.role }}: {{ msg.content }}
+        {% endfor %}
+
+        Relevant Knowledge Articles:
+        {% for article in articles %}
+        ---
+        Title: {{ article.title }}
+        Content: {{ article.content[:500] }}
+        {% endfor %}
+
+        Current Query: {{ query }}
+
+        Provide a helpful response with sources and escalation decision.
+      model:
+        provider: openai
+        name: gpt-4o
+      temperature: 0.3
+      max_tokens: 500
+      output_schema:
+        type: object
+        properties:
+          answer: {type: string}
+          confidence: {type: number, minimum: 0, maximum: 1}
+          sources: {type: array, items: {type: string}}
+          escalate: {type: boolean}
+        required: [answer, confidence, escalate]
+      fallback:
+        on: validation_fail
+        model:
+          provider: openai
+          name: gpt-3.5-turbo
+        static_response: |
+          {
+            "answer": "I apologize, but I'm having trouble processing your request. Please try rephrasing your question or contact support directly.",
+            "confidence": 0,
+            "sources": [],
+            "escalate": true
+          }
+    runtime:
+      timeout_ms: 8000
+      retries: 1
+      retry_backoff_ms: 2000
+    position: {x: 500, y: 200}
+
+  # Update conversation history
+  update_conversation:
+    type: transform
+    inputs:
+      - name: query
+        type: string
+      - name: response
+        type: object
+    outputs:
+      - name: updated
+        type: boolean
+    state:
+      scope: session
+      key: "conversation_{context.session_id}"
+      ttl_seconds: 3600
+    transform:
+      mode: code
+      spec: |
+        def transform(inputs, context, state):
+            # Get current history
+            history = await state.get('history', [])
+
+            # Add new exchange
+            history.append({
+                'role': 'user',
+                'content': inputs['query'],
+                'timestamp': context.event_time
+            })
+            history.append({
+                'role': 'assistant',
+                'content': inputs['response']['answer'],
+                'confidence': inputs['response']['confidence'],
+                'timestamp': context.event_time
+            })
+
+            # Keep last 20 messages
+            if len(history) > 20:
+                history = history[-20:]
+
+            # Save updated history
+            await state.set('history', history)
+
+            return {'updated': True}
+    runtime:
+      timeout_ms: 1000
+    position: {x: 700, y: 200}
+
+  # Check if escalation needed
+  check_escalation:
+    type: transform
+    inputs:
+      - name: response
+        type: object
+      - name: customer_data
+        type: object
+    outputs:
+      - name: should_escalate
+        type: boolean
+      - name: escalation_reason
+        type: string
+    transform:
+      mode: code
+      spec: |
+        def transform(inputs, context, state):
+            response = inputs['response']
+            customer = inputs['customer_data']
+
+            reasons = []
+            should_escalate = False
+
+            # Check various escalation conditions
+            if response.get('escalate', False):
+                reasons.append("Agent requested escalation")
+                should_escalate = True
+
+            if response.get('confidence', 1) < 0.5:
+                reasons.append("Low confidence response")
+                should_escalate = True
+
+            if customer.get('support_tier') == 'platinum':
+                if customer.get('churn_risk', 0) > 0.7:
+                    reasons.append("High-value customer with churn risk")
+                    should_escalate = True
+
+            return {
+                'should_escalate': should_escalate,
+                'escalation_reason': ' | '.join(reasons) if reasons else 'No escalation needed'
+            }
+    position: {x: 700, y: 350}
+
+  # Format final response
+  format_response:
+    type: transform
+    inputs:
+      - name: response
+        type: object
+      - name: updated
+        type: boolean
+      - name: should_escalate
+        type: boolean
+      - name: escalation_reason
+        type: string
+    outputs:
+      - name: final_response
+        type: object
+    transform:
+      mode: declarative
+      spec:
+        op: io.format_response
+        args:
+          template:
+            status: success
+            data:
+              message: "${response.answer}"
+              confidence: "${response.confidence}"
+              sources: "${response.sources}"
+              session_updated: "${updated}"
+              escalation:
+                required: "${should_escalate}"
+                reason: "${escalation_reason}"
+            metadata:
+              session_id: "${context.session_id}"
+              timestamp: "${context.event_time}"
+    position: {x: 900, y: 200}
+
+  # Fallback handler for errors
+  fallback_handler:
+    type: transform
+    inputs:
+      - name: error
+        type: object
+    outputs:
+      - name: final_response
+        type: object
+    transform:
+      mode: code
+      spec: |
+        def transform(inputs, context, state):
+            error = inputs.get('error', {})
+
+            return {
+                'final_response': {
+                    'status': 'error',
+                    'data': {
+                        'message': 'I apologize for the inconvenience. Our system is experiencing issues. Please try again or contact support directly.',
+                        'confidence': 0,
+                        'sources': [],
+                        'escalation': {
+                            'required': True,
+                            'reason': f"System error: {error.get('reason', 'Unknown')}"
+                        }
+                    },
+                    'metadata': {
+                        'error': error.get('reason', 'Unknown error'),
+                        'session_id': context.session_id,
+                        'timestamp': context.event_time
+                    }
+                }
+            }
+    position: {x: 500, y: 400}
+
+edges:
+  # Main flow
+  - from: _input.user_id
+    to: fetch_customer.user_id
+
+  - from: _input.session_id
+    to: get_conversation.session_id
+
+  - from: _input.query
+    to: search_knowledge.query
+
+  - from: fetch_customer.customer_data
+    to: search_knowledge.customer_data
+
+  - from: _input.query
+    to: generate_response.query
+
+  - from: fetch_customer.customer_data
+    to: generate_response.customer_data
+
+  - from: get_conversation.history
+    to: generate_response.history
+
+  - from: search_knowledge.articles
+    to: generate_response.articles
+
+  - from: _input.query
+    to: update_conversation.query
+
+  - from: generate_response.response
+    to: update_conversation.response
+
+  - from: generate_response.response
+    to: check_escalation.response
+
+  - from: fetch_customer.customer_data
+    to: check_escalation.customer_data
+
+  - from: generate_response.response
+    to: format_response.response
+
+  - from: update_conversation.updated
+    to: format_response.updated
+
+  - from: check_escalation.should_escalate
+    to: format_response.should_escalate
+
+  - from: check_escalation.escalation_reason
+    to: format_response.escalation_reason
+
+  - from: format_response.final_response
+    to: _output
+
+  # Error handling
+  - from: generate_response.generation_error
+    to: fallback_handler.error
+
+  - from: fallback_handler.final_response
+    to: _output
+
+deployment:
+  target: kserve
+  kserve:
+    namespace: production
+    service_name: customer-service-agent
+    min_replicas: 2
+    max_replicas: 20
+    target_rps: 100
+    resources:
+      cpu: "2"
+      memory: "4Gi"

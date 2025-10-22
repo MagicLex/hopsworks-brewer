@@ -1,0 +1,113 @@
+version: "1.0"
+
+metadata:
+  name: feature-enrichment-agent
+  description: Simple agent that enriches user data with LLM-inferred preferences
+  author: agent-builder
+  tags: [simple, demo]
+
+context:
+  requires: [user_id]
+
+nodes:
+  # Fetch user features from Hopsworks
+  fetch_features:
+    type: transform
+    inputs:
+      - name: user_id
+        type: string
+    outputs:
+      - name: features
+        type: object
+    transform:
+      mode: declarative
+      spec:
+        op: hopsworks.read_features
+        args:
+          feature_group: users_v1
+          key: "${user_id}"
+    runtime:
+      timeout_ms: 2000
+
+  # Enrich with LLM-inferred preferences
+  enrich_profile:
+    type: transform
+    inputs:
+      - name: features
+        type: object
+    outputs:
+      - name: enriched_profile
+        type: object
+    prompt:
+      system: "You are a data enrichment specialist. Analyze user features and infer preferences."
+      template: |
+        User Profile:
+        Age: {{ features.age }}
+        Location: {{ features.city }}
+        Purchase History: {{ features.purchase_categories }}
+        Browsing Patterns: {{ features.browsing_hours }}
+
+        Infer user preferences and interests as structured data.
+      model:
+        provider: openai
+        name: gpt-4o-mini
+      temperature: 0.2
+      output_schema:
+        type: object
+        properties:
+          lifestyle: {type: string, enum: [active, sedentary, balanced]}
+          interests: {type: array, items: {type: string}}
+          shopping_preference: {type: string, enum: [budget, premium, value]}
+          communication_style: {type: string, enum: [brief, detailed, visual]}
+        required: [lifestyle, interests, shopping_preference, communication_style]
+    transform:
+      mode: code
+      spec: |
+        def transform(inputs, context, state):
+            # Combine original features with LLM enrichment
+            return {
+                'enriched_profile': {
+                    **inputs['features'],
+                    'preferences': inputs.get('prompt_output', {}),
+                    'enriched_at': context.event_time
+                }
+            }
+
+  # Save enriched profile back to Hopsworks
+  save_enriched:
+    type: transform
+    inputs:
+      - name: enriched_profile
+        type: object
+    outputs:
+      - name: success
+        type: boolean
+    transform:
+      mode: declarative
+      spec:
+        op: hopsworks.write_features
+        args:
+          feature_group: users_enriched_v1
+          data: "${enriched_profile}"
+          event_time: "${context.event_time}"
+
+edges:
+  - from: _input.user_id
+    to: fetch_features.user_id
+  - from: fetch_features.features
+    to: enrich_profile.features
+  - from: enrich_profile.enriched_profile
+    to: save_enriched.enriched_profile
+  - from: enrich_profile.enriched_profile
+    to: _output
+
+deployment:
+  target: kserve
+  kserve:
+    namespace: default
+    service_name: feature-enrichment
+    min_replicas: 1
+    max_replicas: 5
+    resources:
+      cpu: "1"
+      memory: "2Gi"
